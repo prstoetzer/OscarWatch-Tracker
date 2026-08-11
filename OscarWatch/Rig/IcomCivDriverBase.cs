@@ -56,6 +56,19 @@ public abstract class IcomCivDriverBase : IRigDriver
     public bool IsConnected => _transport?.IsOpen == true;
     public abstract bool SupportsTracking { get; }
 
+    /// <summary>
+    /// Older CI-V radios can echo a complete outbound frame before their acknowledgement arrives.
+    /// Models that do not need an acknowledgement for continuous tuning may override this to avoid
+    /// retrying a frequency that was already accepted by the radio.
+    /// </summary>
+    protected virtual bool FrequencyWritesRequireAck => true;
+
+    /// <summary>
+    /// Models that commonly omit an acknowledgement for Main/Sub band selection may opt out of
+    /// retrying the same selector when the command produced no explicit ACK or NAK.
+    /// </summary>
+    protected virtual bool RetryVfoSelectWithoutAck => true;
+
     public void Open()
     {
         if (_injectedTransport is not null)
@@ -118,8 +131,20 @@ public abstract class IcomCivDriverBase : IRigDriver
         }
 
         var body = IcomCivCodec.EncodeSetFrequencyHz(hz);
-        if (!SendWithAckRetry(body, $"set frequency on {_currentVfo}"))
-            return false;
+        if (FrequencyWritesRequireAck)
+        {
+            if (!SendWithAckRetry(body, $"set frequency on {_currentVfo}"))
+                return false;
+        }
+        else
+        {
+            var response = _transport.WriteCommand(body, _catDelayMs);
+            if (IsCivNak(response))
+            {
+                Log.Warning("CI-V set frequency on {Vfo} was rejected (0xFA)", _currentVfo);
+                return false;
+            }
+        }
 
         StoreFrequencyHz(_currentVfo, hz);
         return true;
@@ -195,6 +220,13 @@ public abstract class IcomCivDriverBase : IRigDriver
             {
                 Log.Debug("CI-V {Description} NAK (0xFA), attempt {Attempt}", description, attempt + 1);
                 continue;
+            }
+
+            if (!RetryVfoSelectWithoutAck)
+            {
+                Log.Debug("CI-V {Description} no ACK; assuming VFO selected without retry", description);
+                _currentVfo = vfo;
+                return true;
             }
 
             if (changingVfo && attempt < maxAttempts - 1)
